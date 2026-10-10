@@ -1,4 +1,4 @@
-### BOTE Smoother Fix
+### BOTE (Network) Smoother Fix
 Fixes an issue for current live BOTE 1.5.2 where its network smoother prefix doesn't have a null check and can sometimes throw on 
 certain invalid units, breaking `SendTransformBatcher.LateUpdate()` (since this throws in the `ClientUpdate()` => `VisualUpdate()` => 
 BOTE prefix chain, and thus `SendTransformBatcher.LateUpdate()` never runs the later `Client.UpdateSent()` for example, so such a 
