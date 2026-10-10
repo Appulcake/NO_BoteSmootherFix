@@ -1,0 +1,16 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NO_BoteSmootherFix", "NO_BSF\NO_BoteSmootherFix.csproj", "{497EA1E0-E3EB-4685-85EF-EFB2533A3C90}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{497EA1E0-E3EB-4685-85EF-EFB2533A3C90}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{497EA1E0-E3EB-4685-85EF-EFB2533A3C90}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{497EA1E0-E3EB-4685-85EF-EFB2533A3C90}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{497EA1E0-E3EB-4685-85EF-EFB2533A3C90}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

@@ -1,0 +1,8 @@
+bin/
+obj/
+/packages/
+riderModule.iml
+/_ReSharper.Caches/
+Bote_1.5.2.dll
+/.idea
+NO_BoteSmootherFix.sln.DotSettings.user
