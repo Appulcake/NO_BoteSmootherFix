@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -22,12 +23,14 @@ public sealed class Plugin : BaseUnityPlugin
     private ConfigEntry<bool> _debugLogsConfig = null!;
     private Harmony? _harmony;
     private ConfigEntry<bool> _pluginEnabled = null!;
+    internal static Plugin Instance { get; private set; } = null!;
     internal new static ManualLogSource Logger { get; private set; } = null!;
     internal static bool PluginEnabled { get; private set; }
     internal static bool DebugLogs { get; private set; }
     
     private void Awake()
     {
+        Instance = this;
         Logger = base.Logger;
         
         var headless = GameManager.IsHeadless || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Null;
@@ -49,18 +52,25 @@ public sealed class Plugin : BaseUnityPlugin
         {
             TryPatch(typeof(AmmoSendPatch));
             TryPatch(typeof(TurretSendPatch));
+            TryPatch(typeof(RearmSendPatch));
         }
         else
         {
             TryPatch(typeof(SmootherPatch));
             TryPatch(typeof(AmmoReceivePatch));
             TryPatch(typeof(TurretReceivePatch));
+            TryPatch(typeof(RearmReceivePatch));
         }
         
         Logger.LogInfo($"{MyPluginInfo.PLUGIN_GUID} loaded!");
     }
     
-    private void OnDestroy() => _harmony?.UnpatchSelf();
+    private void OnDestroy()
+    {
+        _harmony?.UnpatchSelf();
+        if (ReferenceEquals(Instance, this))
+            Instance = null!;
+    }
     
     private void TryPatch(Type patchClass)
     {
@@ -200,11 +210,14 @@ internal static class AmmoReceivePatch
             return true;
         
         if (Plugin.DebugLogs && AmmoDiagnostics.ShouldLog(__instance, __0))
+        {
             Plugin.Logger.LogWarning($"--- Ammo RPC received/ignored\nNetId: {__instance.NetId}, " +
                                      $"PersistentID: {__instance.persistentID}, Unit: {__instance.unitName}, " +
                                      $"Definition: {__instance.definition?.jsonKey}, StationIndex: {__0}, " +
                                      $"ClientStationCount: {count}, Ammo: {__1}, " +
                                      $"Reason: {(__0 >= count ? "out of range" : "null station")}");
+            StationFollowup.Queue(__instance, __0, "Ammo RPC", count);
+        }
         
         return false;
     }
@@ -313,6 +326,7 @@ internal static class TurretReceivePatch
             return true;
         
         if (Plugin.DebugLogs && TurretDiagnostics.ShouldLog(__instance, __0, true))
+        {
             Plugin.Logger.LogWarning(
                 $"--- Turret RPC received/ignored\n" +
                 $"NetId: {__instance.NetId}, PersistentID: {__instance.persistentID}, " +
@@ -321,6 +335,8 @@ internal static class TurretReceivePatch
                 $"LocalSim: {__instance.LocalSim}, State: {__instance.unitState}, " +
                 $"Reason: {(__0 >= count ? "out of range" : "null station")}\n" +
                 $"StationLayout: {TurretDiagnostics.DescribeStations(__instance)}");
+            StationFollowup.Queue(__instance, __0, "Turret RPC", count);
+        }
         
         return false;
     }
@@ -378,7 +394,7 @@ internal static class TurretDiagnostics
         return true;
     }
     
-    internal static string DescribeStations(Aircraft aircraft)
+    internal static string DescribeStations(Unit aircraft)
     {
         var stations = aircraft.weaponStations;
         if (stations == null)
@@ -413,5 +429,299 @@ internal static class TurretDiagnostics
     private sealed class PerUnitLogState
     {
         internal readonly Dictionary<int, float> NextLog = new();
+    }
+}
+
+internal static class StationFollowup
+{
+    private static readonly ConditionalWeakTable<Unit, State> States = new();
+    
+    internal static void Queue(Unit unit, byte stationIndex, string source, int initialCount)
+    {
+        if (unit == null || Plugin.Instance == null)
+            return;
+        
+        var state = States.GetValue(unit, _ => new State());
+        if (state.Queued)
+            return;
+        
+        state.Queued = true;
+        var identity = $"NetId: {unit.NetId}, PersistentID: {unit.persistentID}, " +
+                       $"Unit: {unit.unitName}, Definition: {unit.definition?.jsonKey}";
+        Plugin.Instance.StartCoroutine(CheckLater(unit, stationIndex, source, initialCount, identity));
+    }
+    
+    private static IEnumerator CheckLater(Unit unit, byte stationIndex, string source, int initialCount,
+        string identity)
+    {
+        yield return new WaitForSecondsRealtime(10f);
+        if (!Plugin.PluginEnabled || !Plugin.DebugLogs)
+            yield break;
+        
+        if (unit == null)
+        {
+            Plugin.Logger.LogWarning($"--- Station follow-up (+10s, {source})\n" +
+                                     $"{identity}, StationIndex: {stationIndex}, " +
+                                     $"InitialStationCount: {initialCount}, " +
+                                     "Result: unit destroyed/unloaded before follow-up");
+            yield break;
+        }
+        
+        try
+        {
+            var stations = unit.weaponStations;
+            var count = stations?.Count ?? 0;
+            var nowValid = stationIndex < count && stations![stationIndex] != null;
+            Plugin.Logger.LogWarning($"--- Station follow-up (+10s, {source})\n" +
+                                     $"{identity}, StationIndex: {stationIndex}, " +
+                                     $"InitialStationCount: {initialCount}, " +
+                                     $"ClientStationCountNow: {count}, " +
+                                     $"RequestedIndexValidNow: {nowValid}\n" +
+                                     $"StationLayout: {TurretDiagnostics.DescribeStations(unit)}");
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger.LogWarning($"--- Station follow-up failed ({source})\n{identity}\n{ex}");
+        }
+    }
+    
+    private sealed class State
+    {
+        internal bool Queued;
+    }
+}
+
+[HarmonyPatch(typeof(Unit), nameof(Unit.RpcRearm))]
+internal static class RearmSendPatch
+{
+    [HarmonyPrefix]
+    [UsedImplicitly]
+    // ReSharper disable once InconsistentNaming
+    private static void Prefix(Unit __instance, RearmEventArgs args)
+    {
+        if (!Plugin.PluginEnabled || !Plugin.DebugLogs || __instance == null ||
+            !RearmDiagnostics.ShouldLog(__instance, 0))
+            return;
+        
+        var stationCount = __instance.weaponStations?.Count ?? 0;
+#pragma warning disable Harmony003
+        var payloadCount = args.Stations?.Length ?? -1;
+#pragma warning restore Harmony003
+        var mismatch = payloadCount != stationCount;
+        
+        var message = $"--- Rearm RPC sending{(mismatch ? " (STATION COUNT MISMATCH)" : "")}\n" +
+                      RearmDiagnostics.Describe(__instance, args, "Server");
+        if (mismatch)
+            Plugin.Logger.LogWarning(message);
+        else
+            Plugin.Logger.LogInfo(message);
+    }
+}
+
+[HarmonyPatch]
+internal static class RearmReceivePatch
+{
+    [UsedImplicitly]
+    private static MethodBase TargetMethod()
+    {
+        var target = AccessTools.Method(typeof(Unit), "UserCode_RpcRearm_1512805087",
+            [typeof(RearmEventArgs)]);
+        if (target != null)
+            return target;
+        
+        foreach (var method in AccessTools.GetDeclaredMethods(typeof(Unit)))
+        {
+            if (!method.Name.StartsWith("UserCode_RpcRearm", StringComparison.Ordinal))
+                continue;
+            var parameters = method.GetParameters();
+            if (parameters.Length == 1 && parameters[0].ParameterType == typeof(RearmEventArgs))
+                return method;
+        }
+        
+        throw new MissingMethodException("Could not locate Unit.UserCode_RpcRearm(RearmEventArgs).");
+    }
+    
+    [HarmonyPrefix]
+    [UsedImplicitly]
+    // ReSharper disable once InconsistentNaming
+    private static bool Prefix(Unit __instance, RearmEventArgs args)
+    {
+        if (!Plugin.PluginEnabled)
+            return true;
+        if (__instance == null)
+            return false;
+        
+        var stations = __instance.weaponStations;
+        var stationCount = stations?.Count ?? 0;
+#pragma warning disable Harmony003
+        var payloadCount = args.Stations?.Length ?? -1;
+#pragma warning restore Harmony003
+        
+        // The vanilla method loops over weaponStations.Count, indexing args.Stations[i], and
+        // weaponStations[i].Weapons[0] without null check / validation
+        var problem = stations == null ? "null weaponStations" :
+            payloadCount < 0 ? "null Stations payload" :
+            payloadCount != stationCount ? "station count mismatch" : null;
+        
+        if (problem == null && stations != null)
+            for (var i = 0; i < stationCount; i++)
+            {
+                var station = stations[i];
+                if (station == null || station.Weapons == null || station.Weapons.Count == 0)
+                {
+                    problem = $"station {i} has no weapon";
+                    break;
+                }
+            }
+        
+        if (problem == null)
+        {
+            if (Plugin.DebugLogs && RearmDiagnostics.ShouldLog(__instance, 3))
+                Plugin.Logger.LogInfo(
+                    "--- Rearm RPC received\n" + RearmDiagnostics.Describe(__instance, args, "Client"));
+            return true;
+        }
+        
+        if (Plugin.DebugLogs && RearmDiagnostics.ShouldLog(__instance, 1))
+            Plugin.Logger.LogWarning($"--- Rearm RPC received/ignored: {problem}\n" +
+                                     RearmDiagnostics.Describe(__instance, args, "Client"));
+        
+        RearmDiagnostics.QueueFollowup(__instance, stationCount, payloadCount);
+        return false;
+    }
+    
+    [HarmonyFinalizer]
+    [UsedImplicitly]
+    // ReSharper disable once InconsistentNaming
+    private static Exception? Finalizer(Unit __instance, RearmEventArgs args,
+        // ReSharper disable once InconsistentNaming
+        Exception? __exception)
+    {
+        if (__exception == null || !Plugin.PluginEnabled)
+            return __exception;
+        
+        // This also catches issues later in the method, including CountermeasureManager.Rearm(args),
+        // which the prefix cannot pre validate
+        if (Plugin.DebugLogs && __instance != null && RearmDiagnostics.ShouldLog(__instance, 2))
+            try
+            {
+                Plugin.Logger.LogError("--- Rearm RPC unexpected exception\n" +
+                                       RearmDiagnostics.Describe(__instance, args, "Client") +
+                                       "\nException: " + __exception);
+            }
+            catch (Exception diagnosticError)
+            {
+                Plugin.Logger.LogError("Rearm diagnostics failed: " + diagnosticError);
+            }
+        
+        return __exception;
+    }
+}
+
+internal static class RearmDiagnostics
+{
+    private static readonly ConditionalWeakTable<Unit, LogState> LogStates = new();
+    private static readonly ConditionalWeakTable<Unit, FollowupState> FollowupStates = new();
+    
+    internal static bool ShouldLog(Unit unit, int kind)
+    {
+        var state = LogStates.GetValue(unit, _ => new LogState());
+        var now = Time.realtimeSinceStartup;
+        if (state.NextLog.TryGetValue(kind, out var next) && now < next)
+            return false;
+        state.NextLog[kind] = now + 30f;
+        return true;
+    }
+    
+    internal static string Describe(Unit unit, RearmEventArgs args, string side)
+    {
+        var values = args.Stations;
+        var stationCount = unit.weaponStations?.Count ?? 0;
+        var payloadCount = values?.Length ?? -1;
+        
+        var sb = new StringBuilder(350);
+        sb.Append("NetId: ").Append(unit.NetId)
+            .Append(", PersistentID: ").Append(unit.persistentID)
+            .Append(", Unit: ").Append(unit.unitName)
+            .Append(", Definition: ").Append(unit.definition?.jsonKey)
+            .Append(", State: ").Append(unit.unitState).Append('\n')
+            .Append(side).Append("StationCount: ").Append(stationCount)
+            .Append(", RearmPayloadLength: ").Append(payloadCount)
+            .Append(", RearmPayload: ");
+        
+        if (values == null)
+        {
+            sb.Append("(null)");
+        }
+        else
+        {
+            sb.Append('[');
+            var limit = Math.Min(values.Length, 32);
+            for (var i = 0; i < limit; i++)
+            {
+                if (i != 0) sb.Append(", ");
+                sb.Append(values[i]);
+            }
+            
+            if (values.Length > limit) sb.Append(", ...");
+            sb.Append(']');
+        }
+        
+        sb.Append("\nStationLayout: ").Append(TurretDiagnostics.DescribeStations(unit));
+        return sb.ToString();
+    }
+    
+    internal static void QueueFollowup(Unit unit, int originalCount, int payloadCount)
+    {
+        if (!Plugin.DebugLogs || unit == null || Plugin.Instance == null)
+            return;
+        
+        var state = FollowupStates.GetValue(unit, _ => new FollowupState());
+        if (state.Queued)
+            return;
+        state.Queued = true;
+        
+        var identity = $"NetId: {unit.NetId}, PersistentID: {unit.persistentID}, " +
+                       $"Unit: {unit.unitName}, Definition: {unit.definition?.jsonKey}";
+        Plugin.Instance.StartCoroutine(CheckLater(unit, originalCount, payloadCount, identity));
+    }
+    
+    private static IEnumerator CheckLater(Unit unit, int originalCount, int payloadCount, string identity)
+    {
+        yield return new WaitForSecondsRealtime(10f);
+        if (!Plugin.PluginEnabled || !Plugin.DebugLogs)
+            yield break;
+        
+        if (unit == null)
+        {
+            Plugin.Logger.LogWarning($"--- Rearm follow-up (+10s)\n{identity}\n" +
+                                     "Result: unit destroyed/unloaded");
+            yield break;
+        }
+        
+        try
+        {
+            var nowCount = unit.weaponStations?.Count ?? 0;
+            Plugin.Logger.LogWarning($"--- Rearm follow-up (+10s)\n{identity}\n" +
+                                     $"InitialClientStationCount: {originalCount}, " +
+                                     $"RearmPayloadLength: {payloadCount}, " +
+                                     $"ClientStationCountNow: {nowCount}, " +
+                                     $"CountsMatchNow: {nowCount == payloadCount}\n" +
+                                     $"StationLayout: {TurretDiagnostics.DescribeStations(unit)}");
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger.LogWarning($"--- Rearm follow-up failed\n{identity}\n{ex}");
+        }
+    }
+    
+    private sealed class LogState
+    {
+        internal readonly Dictionary<int, float> NextLog = new();
+    }
+    
+    private sealed class FollowupState
+    {
+        internal bool Queued;
     }
 }
