@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
@@ -20,7 +21,9 @@ public sealed class Plugin : BaseUnityPlugin
 {
     private ConfigEntry<bool> _debugLogsConfig = null!;
     private Harmony? _harmony;
+    private ConfigEntry<bool> _pluginEnabled = null!;
     internal new static ManualLogSource Logger { get; private set; } = null!;
+    internal static bool PluginEnabled { get; private set; }
     internal static bool DebugLogs { get; private set; }
     
     private void Awake()
@@ -28,6 +31,15 @@ public sealed class Plugin : BaseUnityPlugin
         Logger = base.Logger;
         
         var headless = GameManager.IsHeadless || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Null;
+        _pluginEnabled = Config.Bind("General", "Enable plugin", true);
+        
+        _pluginEnabled.SettingChanged += (_, _) =>
+        {
+            PluginEnabled = _pluginEnabled.Value;
+            Logger.LogInfo($"BOTE Smoother Fix {(PluginEnabled ? "enabled" : "disabled")}.");
+        };
+        
+        PluginEnabled = _pluginEnabled.Value;
         _debugLogsConfig = Config.Bind("General", "Enable debug logs", headless);
         _debugLogsConfig.SettingChanged += (_, _) => DebugLogs = _debugLogsConfig.Value;
         DebugLogs = _debugLogsConfig.Value;
@@ -36,11 +48,13 @@ public sealed class Plugin : BaseUnityPlugin
         if (headless)
         {
             TryPatch(typeof(AmmoSendPatch));
+            TryPatch(typeof(TurretSendPatch));
         }
         else
         {
             TryPatch(typeof(SmootherPatch));
             TryPatch(typeof(AmmoReceivePatch));
+            TryPatch(typeof(TurretReceivePatch));
         }
         
         Logger.LogInfo($"{MyPluginInfo.PLUGIN_GUID} loaded!");
@@ -73,6 +87,9 @@ internal static class SmootherPatch
     // ReSharper disable once InconsistentNaming
     private static bool Prefix(SmoothAircraftNetworkTransform __instance)
     {
+        if (!Plugin.PluginEnabled)
+            return true;
+        
         var aircraft = __instance.Aircraft;
         if (aircraft == null)
             return false;
@@ -107,6 +124,9 @@ internal static class SmootherPatch
     // ReSharper disable once InconsistentNaming
     private static Exception? Finalizer(Exception? __exception)
     {
+        if (!Plugin.PluginEnabled)
+            return __exception;
+        
         if (__exception == null)
             return null;
         
@@ -154,7 +174,8 @@ internal static class AmmoReceivePatch
                 continue;
             
             var parameters = method.GetParameters();
-            if (parameters.Length == 2 && parameters[0].ParameterType == typeof(byte) && parameters[1].ParameterType == typeof(int))
+            if (parameters.Length == 2 && parameters[0].ParameterType == typeof(byte) &&
+                parameters[1].ParameterType == typeof(int))
                 return method;
         }
         
@@ -166,6 +187,9 @@ internal static class AmmoReceivePatch
     // ReSharper disable once InconsistentNaming
     private static bool Prefix(Unit __instance, byte __0, int __1)
     {
+        if (!Plugin.PluginEnabled)
+            return true;
+        
         if (__instance == null)
             return false;
         
@@ -194,6 +218,9 @@ internal static class AmmoSendPatch
     // ReSharper disable once InconsistentNaming
     private static bool Prefix(Unit __instance, byte stationIndex, int ammo)
     {
+        if (!Plugin.PluginEnabled)
+            return true;
+        
         if (__instance == null)
             return false;
         
@@ -206,10 +233,10 @@ internal static class AmmoSendPatch
         
         var stationName = valid ? stations![stationIndex].WeaponInfo?.weaponName : "(missing)";
         var message = $"--- Ammo RPC sending{(valid ? "" : "/ignored")}\n" +
-                  $"NetId: {__instance.NetId}, PersistentID: {__instance.persistentID}, " +
-                  $"Unit: {__instance.unitName}, Definition: {__instance.definition?.jsonKey}, " +
-                  $"StationIndex: {stationIndex}, ServerStationCount: {count}, " +
-                  $"StationName: {stationName}, Ammo: {ammo}";
+                      $"NetId: {__instance.NetId}, PersistentID: {__instance.persistentID}, " +
+                      $"Unit: {__instance.unitName}, Definition: {__instance.definition?.jsonKey}, " +
+                      $"StationIndex: {stationIndex}, ServerStationCount: {count}, " +
+                      $"StationName: {stationName}, Ammo: {ammo}";
         if (valid)
             Plugin.Logger.LogInfo(message);
         else
@@ -237,5 +264,154 @@ internal static class AmmoDiagnostics
     private sealed class PerUnitLogState
     {
         internal readonly Dictionary<byte, float> NextLog = new();
+    }
+}
+
+[HarmonyPatch]
+internal static class TurretReceivePatch
+{
+    [UsedImplicitly]
+    private static MethodBase TargetMethod()
+    {
+        var target = AccessTools.Method(typeof(Aircraft), "UserCode_RpcSetTurretVector_-312569381")
+                     ?? AccessTools.Method(typeof(Aircraft), "UserCode_RpcSetTurretVector__002D312569381");
+        if (target != null)
+            return target;
+        
+        foreach (var method in AccessTools.GetDeclaredMethods(typeof(Aircraft)))
+        {
+            if (!method.Name.StartsWith("UserCode_RpcSetTurretVector", StringComparison.Ordinal))
+                continue;
+            
+            var parameters = method.GetParameters();
+            if (parameters.Length == 2 && parameters[0].ParameterType == typeof(byte) &&
+                parameters[1].ParameterType.Name == "Vector3Compressed")
+                return method;
+        }
+        
+        throw new MissingMethodException(
+            "Could not locate Aircraft.UserCode_RpcSetTurretVector(byte, Vector3Compressed).");
+    }
+    
+    [HarmonyPrefix]
+    [UsedImplicitly]
+    // ReSharper disable once InconsistentNaming
+    private static bool Prefix(Aircraft __instance, byte __0)
+    {
+        if (!Plugin.PluginEnabled)
+            return true;
+        
+        if (__instance == null)
+            return false;
+        
+        if (__instance.LocalSim)
+            return true;
+        
+        var stations = __instance.weaponStations;
+        var count = stations?.Count ?? 0;
+        if (__0 < count && stations![__0] != null)
+            return true;
+        
+        if (Plugin.DebugLogs && TurretDiagnostics.ShouldLog(__instance, __0, true))
+            Plugin.Logger.LogWarning(
+                $"--- Turret RPC received/ignored\n" +
+                $"NetId: {__instance.NetId}, PersistentID: {__instance.persistentID}, " +
+                $"Unit: {__instance.unitName}, Definition: {__instance.definition?.jsonKey}, " +
+                $"StationIndex: {__0}, ClientStationCount: {count}, " +
+                $"LocalSim: {__instance.LocalSim}, State: {__instance.unitState}, " +
+                $"Reason: {(__0 >= count ? "out of range" : "null station")}\n" +
+                $"StationLayout: {TurretDiagnostics.DescribeStations(__instance)}");
+        
+        return false;
+    }
+}
+
+[HarmonyPatch(typeof(Aircraft), nameof(Aircraft.RpcSetTurretVector))]
+internal static class TurretSendPatch
+{
+    [HarmonyPrefix]
+    [UsedImplicitly]
+    // ReSharper disable once InconsistentNaming
+    private static bool Prefix(Aircraft __instance, byte weaponStationIndex)
+    {
+        if (!Plugin.PluginEnabled)
+            return true;
+        
+        if (__instance == null)
+            return false;
+        
+        var stations = __instance.weaponStations;
+        var count = stations?.Count ?? 0;
+        var valid = weaponStationIndex < count && stations![weaponStationIndex] != null;
+        if (!Plugin.DebugLogs || !TurretDiagnostics.ShouldLog(__instance, weaponStationIndex, !valid))
+            return valid;
+        
+        var stationName = valid ? stations![weaponStationIndex].WeaponInfo?.weaponName : "(missing)";
+        var message = $"--- Turret RPC sending{(valid ? "" : "/ignored")}\n" +
+                      $"NetId: {__instance.NetId}, PersistentID: {__instance.persistentID}, " +
+                      $"Unit: {__instance.unitName}, Definition: {__instance.definition?.jsonKey}, " +
+                      $"StationIndex: {weaponStationIndex}, ServerStationCount: {count}, " +
+                      $"StationName: {stationName}";
+        
+        if (valid)
+            Plugin.Logger.LogInfo(message);
+        else
+            Plugin.Logger.LogWarning(message + "\nStationLayout: " + TurretDiagnostics.DescribeStations(__instance));
+        
+        return valid;
+    }
+}
+
+internal static class TurretDiagnostics
+{
+    private static readonly ConditionalWeakTable<Aircraft, PerUnitLogState> States = new();
+    
+    internal static bool ShouldLog(Aircraft aircraft, byte stationIndex, bool invalid)
+    {
+        var state = States.GetValue(aircraft, _ => new PerUnitLogState());
+        var key = stationIndex | (invalid ? 0x100 : 0);
+        var now = Time.realtimeSinceStartup;
+        if (state.NextLog.TryGetValue(key, out var nextTime) && now < nextTime)
+            return false;
+        
+        state.NextLog[key] = now + 30f;
+        return true;
+    }
+    
+    internal static string DescribeStations(Aircraft aircraft)
+    {
+        var stations = aircraft.weaponStations;
+        if (stations == null)
+            return "(null list)";
+        if (stations.Count == 0)
+            return "(empty list)";
+        
+        var builder = new StringBuilder(256);
+        var limit = Math.Min(stations.Count, 32);
+        for (var i = 0; i < limit; i++)
+        {
+            if (i != 0)
+                builder.Append(" | ");
+            
+            var station = stations[i];
+            if (station == null)
+            {
+                builder.Append(i).Append(": (null)");
+                continue;
+            }
+            
+            builder.Append(i).Append(": #").Append(station.Number)
+                .Append(" ").Append(station.WeaponInfo?.weaponName ?? "(unknown weapon)")
+                .Append(" turrets=").Append(station.Turrets?.Count ?? 0);
+        }
+        
+        if (stations.Count > limit)
+            builder.Append(" | ... +").Append(stations.Count - limit).Append(" more");
+        return builder.ToString();
+    }
+    
+    private sealed class PerUnitLogState
+    {
+        internal readonly Dictionary<int, float> NextLog = new();
     }
 }
