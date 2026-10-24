@@ -1,4 +1,8 @@
 ### BOTE (Network) Smoother Fix
+#### Update:
+Root cause for why this was happening was identified to be a null hangar entry in a ship (it became null as its parent linked hangar's ship also became null/got destroyed, vanilla explicitly supports this and does a null check on hangars but BOTE didn't have that check, which'd fail ship's unit initialisation and leave a client in a broken state), and this patch got adjusted to address specifically that directly (doing the same as https://github.com/MinecrackTyler/BoscaliOceanTrainingExercise/commit/e4109d1378ec6b93bc99c26ef28906a81f6b2bfd#diff-44cf714fca81738547d85ff699f9d981a6118b66b1b7fd84b281807403e710da but to current 1.5.2 BOTE to allow existing clients to have it fixed too).
+
+#### Old Readme info:
 Fixes an issue for current live BOTE 1.5.2 where its network smoother prefix doesn't have a null check and can sometimes throw on 
 certain invalid units, breaking `SendTransformBatcher.LateUpdate()` (since this throws in the `ClientUpdate()` => `VisualUpdate()` => 
 BOTE prefix chain, and thus `SendTransformBatcher.LateUpdate()` never runs the later `Client.UpdateSent()` for example, so such a 
